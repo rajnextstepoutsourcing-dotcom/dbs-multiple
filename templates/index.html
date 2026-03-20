@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>DBS Check — NextStep</title>
+  <link rel="stylesheet" href="/static/styles.css"/>
+</head>
+<body>
+  <div class="container">
+    <div class="topBar">
+      <div class="topBar-left">
+        <div class="topBar-brand">
+          <span class="brand-icon">⚡</span>
+          <span class="brand-name">Next<span>Step</span></span>
+          <span class="brand-sep">|</span>
+          <span class="brand-tool">DBS Check</span>
+        </div>
+      </div>
+      <div class="topBar-right">
+        <a href="https://nextstep.co.uk/dashboard" class="btn-back">← Dashboard</a>
+      </div>
+    </div>
+
+    <div id="authWarning" class="auth-warning hidden">
+      <span>⚠</span>
+      <span>You must be logged in. <a href="https://nextstep.co.uk/login">Log in here</a></span>
+    </div>
+
+    <div id="tokenBar" class="token-bar hidden">
+      <span class="token-label">🪙 Tokens remaining:</span>
+      <span id="tokenCount" class="token-count">—</span>
+    </div>
+
+    <p class="muted">Upload DBS PDF/image → Extract → (edit if needed) → Run DBS Check → PDF downloads.</p>
+
+    <section class="card">
+      <h2>Step 1 — Enter details</h2>
+      <div class="grid">
+        <label>Organisation Name<input id="org" type="text" placeholder="e.g., MSL Healthcare"/></label>
+        <label>Forename<input id="forename" type="text" placeholder="e.g., Dhaval"/></label>
+        <label>Surname<input id="surname_user" type="text" placeholder="e.g., Acharya"/></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Step 2 — Upload DBS document</h2>
+      <div id="bulkWrap">
+        <div id="dropZone" class="dropZone">
+          <div class="dzIcon" aria-hidden="true">⬆</div>
+          <div class="dzTitle">Upload DBS Documents</div>
+          <div class="dzSub">Drop files here <span class="muted">or</span> click to upload</div>
+          <div class="dzMeta">PDF / JPG / PNG / CSV / XLSX — Max 100 files</div>
+        </div>
+        <div class="muted small">Supported: PDF (text/scanned), JPG, PNG, WEBP, CSV, XLSX, DOCX. Max 100 files, 100 rows per run.</div>
+        <div id="bulkChips" class="chips"></div>
+        <input id="files" type="file" accept="application/pdf,image/*,.webp,.csv,.xlsx,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" multiple class="hiddenFile"/>
+        <div class="row btnRow">
+          <button id="btnAddMore" type="button">Add more files</button>
+          <button id="btnClearAll" type="button" class="danger">Clear all</button>
+        </div>
+        <div class="row actionBar actionBarTop">
+          <button id="btnExtractBulk">Extract all</button>
+          <span id="bulkCount" class="pill"></span>
+          <span id="bulkRowCount" class="pill"></span>
+          <span id="extractBulkStatus" class="muted"></span>
+        </div>
+        <div class="divider"></div>
+        <h3>Extracted list (editable)</h3>
+        <div id="bulkHeader" class="bulkHeader" aria-hidden="true">
+          <div class="bulkHeaderLeft"><span>Remove</span><span>#</span></div>
+          <div class="bulkHeaderMain"><span>Source</span><span>Certificate</span><span>Surname</span><span>DOB (DD/MM/YYYY)</span></div>
+          <div class="bulkHeaderRight"><span>Status</span><span>Output</span></div>
+        </div>
+        <div id="bulkList" class="bulkList"></div>
+        <div class="row actionBar actionBarBottom">
+          <button id="btnRunBulk" class="primary">Run All Checks</button>
+          <button id="btnRerun" class="btn-rerun hidden" type="button">↺ Rerun Edited Rows</button>
+          <a id="btnDlZip" class="btnLink zipBtn disabledLink" href="#" download>⬇ Download All PDFs (ZIP)</a>
+          <button id="btnDlResultsXlsx" type="button" class="ghost">Download Results Excel (Optional)</button>
+          <button id="btnDlResultsCsv" type="button" class="ghost">Download Results CSV (Optional)</button>
+          <span id="runBulkStatus" class="muted"></span>
+          <div id="zipNotice" class="muted"></div>
+        </div>
+
+        <!-- Progress bar -->
+        <div id="progressWrap" class="progress-wrap hidden">
+          <div class="progress-header">
+            <span id="progressBadge" class="badge running">⏳ Processing</span>
+            <span id="progressCount" class="progress-count">0 of 0 complete</span>
+          </div>
+          <div class="progress-bar-outer">
+            <div id="progressBar" class="progress-bar-inner" style="width:0%"></div>
+          </div>
+          <div id="progressMsg" class="muted small" style="margin-top:6px;"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
