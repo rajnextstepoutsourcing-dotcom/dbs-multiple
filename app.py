@@ -225,22 +225,71 @@ MONTHS = {
     "JAN":"01","FEB":"02","MAR":"03","APR":"04","JUN":"06","JUL":"07","AUG":"08",
     "SEP":"09","SEPT":"09","OCT":"10","NOV":"11","DEC":"12",
 }
+MONTH_ALIASES = {
+    "JANUARI":"JANUARY","FEBRUARI":"FEBRUARY","MARH":"MARCH","APRL":"APRIL",
+    "JUNE":"JUNE","JULY":"JULY","AUGI":"AUG","AUGL":"AUG","AUC":"AUG",
+    "SEPTEM8ER":"SEPTEMBER","SEPTEMPER":"SEPTEMBER","0CT":"OCT","NOVEM8ER":"NOVEMBER",
+    "DECEM8ER":"DECEMBER",
+}
+
+
+def normalize_month_value(value):
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if s.isdigit():
+        n = int(s)
+        return f"{n:02d}" if 1 <= n <= 12 else ""
+    token = re.sub(r"[^A-Za-z0-9]", "", s).upper()
+    if not token:
+        return ""
+    token = token.replace("0", "O").replace("1", "I").replace("5", "S").replace("8", "B")
+    token = MONTH_ALIASES.get(token, token)
+    if token in MONTHS:
+        return MONTHS[token]
+    if len(token) >= 3:
+        short = token[:3]
+        if short in MONTHS:
+            return MONTHS[short]
+        import difflib
+        match = difflib.get_close_matches(short, [k for k in MONTHS if len(k) == 3], n=1, cutoff=0.66)
+        if match:
+            return MONTHS[match[0]]
+    match = None
+    try:
+        import difflib
+        match = difflib.get_close_matches(token, [k for k in MONTHS if len(k) > 3], n=1, cutoff=0.72)
+    except Exception:
+        match = None
+    return MONTHS.get(match[0], "") if match else ""
+
+
+def normalize_dob_parts(dd, mm, yy):
+    dd = str(dd or "").strip()
+    mm = normalize_month_value(mm)
+    yy = str(yy or "").strip()
+    if dd.isdigit():
+        dd = dd.zfill(2)
+    if len(yy) == 2 and yy.isdigit():
+        yy = ("19" if int(yy) > 30 else "20") + yy
+    return dd, mm, yy
+
 
 def parse_uk_date_words(date_str):
     if not date_str: return None
     s = normalize_ws(date_str).upper()
     m = re.search(r"\b(\d{1,2})\s+([A-Z]{3,9})\s+(\d{4})\b", s)
     if not m: return None
-    dd = m.group(1).zfill(2); mon = MONTHS.get(m.group(2)); yyyy = m.group(3)
+    dd = m.group(1).zfill(2); mon = normalize_month_value(m.group(2)); yyyy = m.group(3)
     return (dd, mon, yyyy) if mon else None
 
 def parse_ddmmyyyy(date_str):
     if not date_str: return None
     m = re.search(r"\b(\d{1,2})[\/\.-](\d{1,2})[\/\.-](\d{2,4})\b", normalize_ws(date_str))
     if not m: return None
-    dd = m.group(1).zfill(2); mm = m.group(2).zfill(2); yy = m.group(3)
+    dd = m.group(1).zfill(2); mm = normalize_month_value(m.group(2)); yy = m.group(3)
     if len(yy) == 2: yy = ("19" if int(yy) > 30 else "20") + yy
-    return dd, mm, yy
+    return (dd, mm, yy) if mm else None
 
 def validate_cert_number(s):
     if not s: return None
@@ -393,7 +442,8 @@ def gemini_vision_extract_images(images):
         obj = data.get(key)
         if isinstance(obj, dict):
             dd = str(obj.get("day","")).zfill(2) if str(obj.get("day","")).strip() else ""
-            mm = str(obj.get("month","")).zfill(2) if str(obj.get("month","")).strip() else ""
+            raw_mm = str(obj.get("month","")).strip()
+            mm = normalize_month_value(raw_mm) if raw_mm else ""
             yy = str(obj.get("year","")).strip()
             if dd and mm and yy: return {"dd": dd, "mm": mm, "yyyy": yy}
         parts = parse_uk_date_words(_gv(key)) or parse_ddmmyyyy(_gv(key))
@@ -411,13 +461,14 @@ def _parse_dob_value(v):
     if isinstance(v, (datetime.date, datetime.datetime)):
         d = v.date() if isinstance(v, datetime.datetime) else v
         return (str(d.day).zfill(2), str(d.month).zfill(2), str(d.year))
-    s = str(v).strip()
+    s = normalize_ws(str(v).strip())
     if not s: return ("","","")
     m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$", s)
-    if m: return (m.group(3).zfill(2), m.group(2).zfill(2), m.group(1))
+    if m: return (m.group(3).zfill(2), normalize_month_value(m.group(2)), m.group(1))
     m = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$", s)
-    if m: return (m.group(1).zfill(2), m.group(2).zfill(2), m.group(3))
-    return ("","","")
+    if m: return (m.group(1).zfill(2), normalize_month_value(m.group(2)), m.group(3))
+    parts = parse_uk_date_words(s) or parse_ddmmyyyy(s)
+    return parts if parts else ("","","")
 
 def parse_csv_rows(content):
     text = None
@@ -639,6 +690,18 @@ def _dispatcher_loop():
 
 def _now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
+
+
+def _normalize_item_fields(it: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(it or {})
+    dd, mm, yy = normalize_dob_parts(out.get("dob_day"), out.get("dob_month"), out.get("dob_year"))
+    out["dob_day"], out["dob_month"], out["dob_year"] = dd, mm, yy
+    idd, imm, iyy = normalize_dob_parts(out.get("issue_day"), out.get("issue_month"), out.get("issue_year"))
+    out["issue_day"], out["issue_month"], out["issue_year"] = idd, imm, iyy
+    out["certificate_number"] = (out.get("certificate_number") or "").strip()
+    out["surname"] = (out.get("surname") or "").strip()
+    out["forename"] = (out.get("forename") or "").strip()
+    return out
 
 
 def _create_parent_job(tenant_id: int, user_id: int, items: List[dict], db_job_id: Optional[int], storage_path: Path,
@@ -865,7 +928,7 @@ async def dbs_run(request: Request):
     items = payload.get("items")
     if not isinstance(items, list) or not items:
         raise HTTPException(400, "No items provided.")
-    items = items[:100]
+    items = [_normalize_item_fields(it) for it in items[:100]]
     try:
         import db
         tokens = db.get_tenant_tokens_remaining(tenant_id)
@@ -979,6 +1042,7 @@ async def dbs_rerun(request: Request):
         import db
         db_job_id = db.create_job_record(tenant_id=tenant_id, user_id=user_id, total_items=len(dirty_items))
     except Exception as e: log.warning("[Rerun] DB record: %s", e)
+    dirty_items = [_normalize_item_fields(it) for it in dirty_items]
     dirty_map = {int(it.get("row_number") or 0): it for it in dirty_items}
     merged_rows = []
     for r0 in old_rows:

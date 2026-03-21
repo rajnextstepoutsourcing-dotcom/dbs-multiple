@@ -58,8 +58,8 @@ def _update_row(job_id: str, row_number: int, updater):
             return None
         row = rows[idx]
         updater(row)
-        successful = sum(1 for r in rows if r.get("status") == "clear")
-        failed = sum(1 for r in rows if r.get("status") in ("needs_review", "portal_unavailable", "failed"))
+        successful = sum(1 for r in rows if r.get("status") in ("clear", "needs_review"))
+        failed = sum(1 for r in rows if r.get("status") in ("portal_unavailable", "failed"))
         running = sum(1 for r in rows if r.get("status") == "running")
         queued = sum(1 for r in rows if r.get("status") == "queued")
         total = len(rows)
@@ -106,8 +106,8 @@ def _finalize_parent_if_complete(job_id: str):
             return
         rows = state.get("rows") or []
         total = len(rows)
-        successful = sum(1 for r in rows if r.get("status") == "clear")
-        failed = sum(1 for r in rows if r.get("status") in ("needs_review", "portal_unavailable", "failed"))
+        successful = sum(1 for r in rows if r.get("status") in ("clear", "needs_review"))
+        failed = sum(1 for r in rows if r.get("status") in ("portal_unavailable", "failed"))
         running = sum(1 for r in rows if r.get("status") == "running")
         queued = sum(1 for r in rows if r.get("status") == "queued")
         if total == 0 or successful + failed < total or running or queued:
@@ -225,13 +225,12 @@ def process_dbs_child(job_data: Dict[str, Any]) -> Dict[str, Any]:
         job_data["status"] = "portal_unavailable"; _cset(child_id, job_data); _finalize_parent_if_complete(job_id)
         return {"ok": False, "error": "portal unavailable"}
     if not pdf_src or not Path(pdf_src).exists():
-        if result.get("no_pdf") and status == "needs_review":
-            def mark_review(row: dict):
-                row["status"] = "needs_review"
-                row["notes"] = "Needs Review — no PDF from portal."
-            _update_row(job_id, row_number, mark_review)
-            job_data["status"] = "needs_review"; _cset(child_id, job_data); _finalize_parent_if_complete(job_id)
-            return {"ok": True, "status": "needs_review"}
+        def mark_failed_no_pdf(row: dict):
+            row["status"] = "failed"
+            row["error"] = "Portal result PDF was not produced."
+        _update_row(job_id, row_number, mark_failed_no_pdf)
+        job_data["status"] = "failed"; _cset(child_id, job_data); _finalize_parent_if_complete(job_id)
+        return {"ok": False, "error": result.get("error") or "Portal result PDF was not produced."}
         def mark_failed(row: dict):
             row["status"] = "failed"
             row["error"] = result.get("error") or "PDF not produced."
