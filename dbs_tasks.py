@@ -1,287 +1,255 @@
-"""
-dbs_tasks.py — DBS job task executed by RQ worker
-Processes all DBS rows for a single job sequentially (1 at a time).
-"""
-
-import logging, os, shutil, time, zipfile, re, json
-from datetime import datetime
+"""dbs_tasks.py — Child task processor for DBS."""
+import os, json, logging, zipfile, shutil, threading, datetime, time, re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from zoneinfo import ZoneInfo
+from typing import Dict, Any, List, Optional
 
 log = logging.getLogger(__name__)
+STATE_LOCK = threading.Lock()
+JOB_PREFIX = "nextstep:dbs:job:"
+CHILD_PREFIX = "nextstep:dbs:child:"
 
-STORAGE_ROOT = Path("/tmp/nextstep")
-
-# Hard failures — skip retry
-HARD_FAILURE_PATTERNS = [
-    "site unavailable", "service unavailable", "maintenance",
-    "503", "502", "connection refused", "network is unreachable",
-    "portal_unavailable",
-]
-
-def _is_hard_failure(error_str: str) -> bool:
-    el = (error_str or "").lower()
-    return any(p in el for p in HARD_FAILURE_PATTERNS)
-
-def _safe_filename(name: str, default: str) -> str:
-    name = re.sub(r"\s+", " ", (name or "").strip()) or default
-    return re.sub(r'[\\/:"*?<>|]+', "-", name).strip()
-
-def _uk_date() -> str:
-    try:
-        return datetime.now(tz=ZoneInfo("Europe/London")).strftime("%d.%m.%Y")
-    except Exception:
-        return datetime.utcnow().strftime("%d.%m.%Y")
 
 def _get_redis():
-    import redis as rl
-    return rl.Redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379"))
+    import redis as redis_lib
+    url = os.environ.get("REDIS_URL", "redis://localhost:6379")
+    return redis_lib.Redis.from_url(url)
 
-def _rstate(job_id: str, updates: Dict) -> None:
+
+def _jget(job_id: str) -> Optional[dict]:
     try:
-        r = _get_redis()
-        key = f"nextstep:dbs:job:{job_id}"
-        raw = r.get(key)
-        existing = json.loads(raw) if raw else {}
-        existing.update(updates)
-        r.setex(key, 3600, json.dumps(existing))
-    except Exception as e:
-        log.warning("[Task] Redis update failed: %s", e)
+        raw = _get_redis().get(f"{JOB_PREFIX}{job_id}")
+        if not raw:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        return json.loads(raw)
+    except Exception:
+        return None
 
-def _rrows(job_id: str, rows: List[Dict]) -> None:
-    _rstate(job_id, {"rows": rows})
 
-def _schedule_cleanup(path: Path, delay: int = 600) -> None:
-    import threading
-    def _del():
-        time.sleep(delay)
+def _jset(job_id: str, state: dict):
+    _get_redis().setex(f"{JOB_PREFIX}{job_id}", 60 * 60 * 8, json.dumps(state))
+
+
+def _cset(child_id: str, state: dict):
+    _get_redis().setex(f"{CHILD_PREFIX}{child_id}", 60 * 60 * 8, json.dumps(state))
+
+
+def _safe_filename(name, default):
+    name = re.sub(r"\s+", " ", (name or "").strip()) or default
+    name = re.sub(r'[\/:"*?<>|]+', "-", name)
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def _uk_now_str() -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(tz=ZoneInfo("Europe/London")).strftime("%d.%m.%Y")
+    except Exception:
+        return datetime.datetime.utcnow().strftime("%d.%m.%Y")
+
+
+def _update_row(job_id: str, row_number: int, updater):
+    with STATE_LOCK:
+        state = _jget(job_id) or {}
+        rows = state.get("rows") or []
+        idx = max(0, row_number - 1)
+        if idx >= len(rows):
+            return None
+        row = rows[idx]
+        updater(row)
+        successful = sum(1 for r in rows if r.get("status") == "clear")
+        failed = sum(1 for r in rows if r.get("status") in ("needs_review", "portal_unavailable", "failed"))
+        running = sum(1 for r in rows if r.get("status") == "running")
+        queued = sum(1 for r in rows if r.get("status") == "queued")
+        total = len(rows)
+        state["rows"] = rows
+        state["successful"] = successful
+        state["failed"] = failed
+        state["running_count"] = running
+        state["queued_count"] = queued
+        state["state"] = "done" if total and successful + failed >= total else ("running" if running else "queued")
+        state["message"] = f"{successful + failed} / {total} completed"
+        _jset(job_id, state)
+        return state
+
+
+def _schedule_cleanup(path: Path, delay_seconds: int = 600):
+    def _delete():
+        time.sleep(delay_seconds)
         try:
             if path.exists():
                 shutil.rmtree(path, ignore_errors=True)
-                log.info("[Cleanup] Deleted: %s", path)
         except Exception as e:
-            log.warning("[Cleanup] %s: %s", path, e)
-    threading.Thread(target=_del, daemon=True).start()
+            log.warning("[Cleanup] Failed to delete %s: %s", path, e)
+    threading.Thread(target=_delete, daemon=True).start()
 
 
-def process_dbs_job(job_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Main task executed by RQ worker.
-    Handles both single and bulk DBS checks sequentially.
-    """
-    from dbs_runner import run_dbs_check_and_download_pdf
-    import db
-
-    job_id       = job_data["job_id"]
-    db_job_id    = job_data.get("db_job_id")
-    tenant_id    = job_data.get("tenant_id", 0)
-    user_id      = job_data.get("user_id", 0)
-    items        = job_data.get("items", [])
-    storage_path = Path(job_data["storage_path"])
-    org_name     = job_data.get("organisation_name", "")
-    emp_forename = job_data.get("employee_forename", "")
-    emp_surname  = job_data.get("employee_surname", "")
-    storage_path.mkdir(parents=True, exist_ok=True)
-
-    log.info("[Task] DBS job %s started — %d items tenant=%s", job_id, len(items), tenant_id)
-    _rstate(job_id, {"state": "running", "message": "Processing checks..."})
-
-    checked_date = _uk_date()
-    pdf_names: List[str] = []
-    rows = []
-    successful = 0
-    failed = 0
-
-    # Init rows
-    for i, it in enumerate(items[:100]):
-        it_d = it if isinstance(it, dict) else {}
-        rows.append({
-            "row": i + 1,
-            "status": "queued",
-            "certificate_number": it_d.get("certificate_number", ""),
-            "surname": it_d.get("surname", ""),
-            "forename": it_d.get("forename", ""),
-            "dob_day": it_d.get("dob_day", ""),
-            "dob_month": it_d.get("dob_month", ""),
-            "dob_year": it_d.get("dob_year", ""),
-            "issue_day": it_d.get("issue_day", ""),
-            "issue_month": it_d.get("issue_month", ""),
-            "issue_year": it_d.get("issue_year", ""),
-            "original_filename": it_d.get("original_filename", f"Row {i+1}"),
-            "pdf_filename": "", "pdf_url": "",
-            "error": "", "notes": "",
-        })
-    _rrows(job_id, rows)
-
-    # ── Rerun: only process dirty rows ──────────────────────────────────────
-    is_rerun = job_data.get("is_rerun", False)
-    dirty_row_nums = set(job_data.get("dirty_row_nums", []))
-    old_rows = job_data.get("old_rows", [])
-
-    if is_rerun and old_rows:
-        rows = []
-        for r in old_rows:
-            rnum = r.get("row", 0)
-            if rnum in dirty_row_nums:
-                rows.append({**r, "status": "queued", "pdf_filename": "", "pdf_url": "", "error": "", "notes": ""})
-            else:
-                rows.append(r)
-        items = [it for it in items if it.get("row_number") in dirty_row_nums]
-        _rrows(job_id, rows)
-
-    # Process one at a time
-    for i, it in enumerate(items[:100]):
-        it_d = it if isinstance(it, dict) else {}
-        row  = rows[i]
-
-        cert    = str(it_d.get("certificate_number") or "").strip()
-        surname = str(it_d.get("surname") or it_d.get("surname_extracted") or "").strip()
-        dob_dd  = str(it_d.get("dob_day") or "").strip()
-        dob_mm  = str(it_d.get("dob_month") or "").strip()
-        dob_yy  = str(it_d.get("dob_year") or "").strip()
-
-        # Validate
-        from app import validate_cert_number
-        cert_clean = validate_cert_number(cert)
-        if not cert_clean:
-            row["status"] = "needs_review"; row["error"] = "Invalid certificate number."; failed += 1
-            _rrows(job_id, rows); continue
-        if not surname:
-            row["status"] = "needs_review"; row["error"] = "Surname missing."; failed += 1
-            _rrows(job_id, rows); continue
-        if not (dob_dd and dob_mm and dob_yy):
-            row["status"] = "needs_review"; row["error"] = "DOB incomplete."; failed += 1
-            _rrows(job_id, rows); continue
-
-        row["status"] = "running"
-        _rrows(job_id, rows)
-        log.info("[Task] DBS job %s row %d cert=%s", job_id, i+1, cert_clean)
-
-        item_dir = storage_path / f"item_{i+1:03d}"
-        item_dir.mkdir(parents=True, exist_ok=True)
-
-        try:
-            result = run_dbs_check_and_download_pdf(
-                organisation_name=org_name,
-                employee_forename=emp_forename,
-                employee_surname=emp_surname,
-                certificate_number=cert_clean,
-                applicant_surname=surname,
-                dob_day=dob_dd.zfill(2),
-                dob_month=dob_mm.zfill(2),
-                dob_year=dob_yy,
-                out_dir=item_dir,
-                headless=True,
-            )
-        except Exception as e:
-            result = {"status": "needs_review", "error": str(e), "pdf_path": ""}
-
-        status = (result.get("status") or "needs_review").strip()
-        if status not in ("clear", "needs_review", "portal_unavailable"):
-            status = "needs_review"
-
-        row["status"] = status
-
-        if status == "portal_unavailable":
-            row["error"] = "DBS portal unavailable. Try again later."
-            failed += 1
-            _rrows(job_id, rows); continue
-
-        pdf_src = result.get("pdf_path") or ""
-        if not pdf_src or not Path(pdf_src).exists():
-            if result.get("no_pdf") and status == "needs_review":
-                row["notes"] = "Needs Review — no PDF from portal."
-                failed += 1
-                _rrows(job_id, rows); continue
-            row["error"] = result.get("error") or "PDF not produced."
-            failed += 1
-            _rrows(job_id, rows); continue
-
-        status_label = "Clear" if status == "clear" else "Needs-Review"
-        out_sn = _safe_filename(surname.upper(), f"SURNAME{i+1}")
-        final_name = _safe_filename(
-            f"{out_sn} - {cert_clean} - {status_label} - {checked_date}.pdf",
-            f"DBS-Result-{i+1}.pdf"
-        )
-        final_path = storage_path / final_name
-        try:
-            if final_path.exists(): final_path.unlink()
-            shutil.move(pdf_src, str(final_path))
-        except Exception:
-            final_path = Path(pdf_src); final_name = final_path.name
-
-        pdf_names.append(final_name)
-        row.update({
-            "status": status,
-            "pdf_filename": final_name,
-            "pdf_url": f"/dbs/download/{job_id}/{final_name}",
-        })
-        successful += 1
-        log.info("[Task] DBS row %d done: %s", i+1, status)
-        _rrows(job_id, rows)
-
-    # ZIP
-    if is_rerun:
-        zip_name, zip_ready = _build_zip_from_folder(storage_path, checked_date)
-        if zip_ready: log.info("[Task] ZIP rebuilt: %s", zip_name)
-        else: zip_name = ""; zip_ready = False
-    else:
-        zip_name = ""; zip_ready = False
-        if len(pdf_names) >= 2:
-            zip_name = _safe_filename(f"DBS_Checks_{checked_date}.zip", "DBS_Checks.zip")
-            zip_path = storage_path / zip_name
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for pn in pdf_names:
-                    fp = storage_path / pn
-                    if fp.exists(): zf.write(fp, arcname=pn)
-            zip_ready = True
-            log.info("[Task] ZIP: %s", zip_name)
-
-    msg = "" if successful > 0 else "No PDFs generated. DBS portal may be unavailable."
-    if not successful and not failed:
-        msg = "All items were skipped due to validation errors."
-
-    # Merge rerun rows back with full row list
-    if is_rerun and old_rows:
-        final_rows = []
-        rerun_map = {r.get("row",0): r for r in rows if r.get("row",0) in dirty_row_nums}
-        for r in old_rows:
-            rnum = r.get("row", 0)
-            if rnum in rerun_map: final_rows.append(rerun_map[rnum])
-            else: final_rows.append(r)
-        rows = final_rows
-
-    _rstate(job_id, {
-        "state": "done", "rows": rows,
-        "zip_ready": zip_ready, "zip_name": zip_name,
-        "zip_url": f"/dbs/download/{job_id}/{zip_name}" if zip_ready else "",
-        "message": msg, "checked_date": checked_date,
-        "successful": successful, "failed": failed,
-    })
-    log.info("[Task] DBS job %s done — %d ok, %d failed", job_id, successful, failed)
-
-    # Update DB
-    if db_job_id:
-        db.update_job_status(db_job_id=db_job_id,
-                             status="completed" if successful > 0 else "failed",
-                             successful_items=successful, failed_items=failed)
-    if successful > 0 and tenant_id:
-        db.record_usage(tenant_id=tenant_id, user_id=user_id,
-                        db_job_id=db_job_id, successful_outputs=successful)
-
-    _schedule_cleanup(storage_path, delay=600)
-    return {"ok": True, "successful": successful, "failed": failed}
-
-
-def _build_zip_from_folder(storage_path, checked_date):
-    """Rebuild ZIP from ALL PDFs in folder. Used on rerun."""
-    all_pdfs = [f.name for f in storage_path.glob("*.pdf") if f.is_file()]
-    if len(all_pdfs) < 2: return "", False
+def _build_zip_from_folder(storage_path: Path, checked_date: str):
+    all_pdfs = [f.name for f in storage_path.glob("*.pdf") if f.is_file() and not f.name.lower().endswith('.zip')]
+    if len(all_pdfs) < 2:
+        return "", False
     zip_name = _safe_filename(f"DBS_Checks_{checked_date}.zip", "DBS_Checks.zip")
     zip_path = storage_path / zip_name
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for pn in all_pdfs:
-            fp = storage_path / pn
-            if fp.exists(): zf.write(fp, arcname=pn)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for pdfn in all_pdfs:
+            fp = storage_path / pdfn
+            if fp.exists():
+                zf.write(fp, arcname=pdfn)
     return zip_name, True
+
+
+def _finalize_parent_if_complete(job_id: str):
+    with STATE_LOCK:
+        state = _jget(job_id)
+        if not state:
+            return
+        rows = state.get("rows") or []
+        total = len(rows)
+        successful = sum(1 for r in rows if r.get("status") == "clear")
+        failed = sum(1 for r in rows if r.get("status") in ("needs_review", "portal_unavailable", "failed"))
+        running = sum(1 for r in rows if r.get("status") == "running")
+        queued = sum(1 for r in rows if r.get("status") == "queued")
+        if total == 0 or successful + failed < total or running or queued:
+            _jset(job_id, state)
+            return
+        storage_path = Path(state.get("storage_path") or "")
+        checked_date = _uk_now_str()
+        zip_name, zip_ready = _build_zip_from_folder(storage_path, checked_date)
+        state["state"] = "done"
+        state["zip_ready"] = zip_ready
+        state["zip_name"] = zip_name
+        state["zip_url"] = f"/dbs/download/{job_id}/{zip_name}" if zip_ready else ""
+        state["checked_date"] = checked_date
+        state["message"] = f"Completed {successful + failed} / {total}"
+        state["successful"] = successful
+        state["failed"] = failed
+        _jset(job_id, state)
+    db_job_id = state.get("db_job_id")
+    tenant_id = state.get("tenant_id")
+    user_id = state.get("user_id")
+    if db_job_id:
+        try:
+            import db
+            final_status = "completed" if successful > 0 else "failed"
+            db.update_job_status(db_job_id=db_job_id, status=final_status, successful_items=successful, failed_items=failed)
+        except Exception as e:
+            log.warning("[Task] DB final update failed: %s", e)
+    if successful > 0 and tenant_id:
+        try:
+            import db
+            db.record_usage(tenant_id=tenant_id, user_id=user_id, db_job_id=db_job_id, successful_outputs=successful)
+        except Exception as e:
+            log.warning("[Task] record_usage failed: %s", e)
+    if storage_path:
+        _schedule_cleanup(storage_path, delay_seconds=600)
+
+
+def process_dbs_child(job_data: Dict[str, Any]) -> Dict[str, Any]:
+    from dbs_runner import run_dbs_check_and_download_pdf
+    from app import validate_cert_number
+    import db
+    if not job_data:
+        return {"ok": False, "error": "Missing child payload"}
+    child_id = job_data["child_id"]
+    job_id = job_data["job_id"]
+    row_number = int(job_data.get("row_number") or 1)
+    storage_path = Path(job_data["storage_path"])
+    storage_path.mkdir(parents=True, exist_ok=True)
+    checked_date = _uk_now_str()
+    state = _jget(job_id) or {}
+    db_job_id = state.get("db_job_id")
+    if db_job_id:
+        try:
+            db.update_job_status(db_job_id=db_job_id, status="running", successful_items=state.get("successful", 0), failed_items=state.get("failed", 0))
+        except Exception:
+            pass
+    def mark_running(row: dict):
+        row["status"] = "running"
+        row["error"] = ""
+    _update_row(job_id, row_number, mark_running)
+    cert = str(job_data.get("certificate_number") or "").strip()
+    surname = str(job_data.get("surname") or "").strip()
+    forename = str(job_data.get("forename") or "").strip()
+    dob_dd = str(job_data.get("dob_day") or "").strip()
+    dob_mm = str(job_data.get("dob_month") or "").strip()
+    dob_yy = str(job_data.get("dob_year") or "").strip()
+    org_name = str(job_data.get("organisation_name") or "").strip()
+    emp_fn = str(job_data.get("employee_forename") or "").strip()
+    emp_sn = str(job_data.get("employee_surname") or "").strip()
+    cert_clean = validate_cert_number(cert)
+    if not cert_clean:
+        def mark_invalid(row: dict):
+            row["status"] = "failed"; row["error"] = "Invalid certificate number."
+        _update_row(job_id, row_number, mark_invalid)
+        job_data["status"] = "failed"; _cset(child_id, job_data); _finalize_parent_if_complete(job_id)
+        return {"ok": False, "error": "Invalid certificate number."}
+    if not surname:
+        def mark_missing(row: dict):
+            row["status"] = "failed"; row["error"] = "Surname missing."
+        _update_row(job_id, row_number, mark_missing)
+        job_data["status"] = "failed"; _cset(child_id, job_data); _finalize_parent_if_complete(job_id)
+        return {"ok": False, "error": "Surname missing."}
+    if not (dob_dd and dob_mm and dob_yy):
+        def mark_dob(row: dict):
+            row["status"] = "failed"; row["error"] = "DOB incomplete."
+        _update_row(job_id, row_number, mark_dob)
+        job_data["status"] = "failed"; _cset(child_id, job_data); _finalize_parent_if_complete(job_id)
+        return {"ok": False, "error": "DOB incomplete."}
+    item_dir = storage_path / f"item_{row_number:03d}"
+    item_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        result = run_dbs_check_and_download_pdf(
+            organisation_name=org_name,
+            employee_forename=emp_fn,
+            employee_surname=emp_sn,
+            certificate_number=cert_clean,
+            applicant_surname=surname,
+            dob_day=dob_dd.zfill(2),
+            dob_month=dob_mm.zfill(2),
+            dob_year=dob_yy,
+            out_dir=item_dir,
+            headless=True,
+        )
+    except Exception as e:
+        result = {"status": "failed", "error": str(e), "pdf_path": ""}
+    status = (result.get("status") or "failed").strip()
+    if status not in ("clear", "needs_review", "portal_unavailable", "failed"):
+        status = "failed"
+    pdf_src = result.get("pdf_path") or ""
+    if status == "portal_unavailable":
+        def mark_portal(row: dict):
+            row["status"] = "portal_unavailable"
+            row["error"] = "DBS portal unavailable. Try again later."
+        _update_row(job_id, row_number, mark_portal)
+        job_data["status"] = "portal_unavailable"; _cset(child_id, job_data); _finalize_parent_if_complete(job_id)
+        return {"ok": False, "error": "portal unavailable"}
+    if not pdf_src or not Path(pdf_src).exists():
+        if result.get("no_pdf") and status == "needs_review":
+            def mark_review(row: dict):
+                row["status"] = "needs_review"
+                row["notes"] = "Needs Review — no PDF from portal."
+            _update_row(job_id, row_number, mark_review)
+            job_data["status"] = "needs_review"; _cset(child_id, job_data); _finalize_parent_if_complete(job_id)
+            return {"ok": True, "status": "needs_review"}
+        def mark_failed(row: dict):
+            row["status"] = "failed"
+            row["error"] = result.get("error") or "PDF not produced."
+        _update_row(job_id, row_number, mark_failed)
+        job_data["status"] = "failed"; _cset(child_id, job_data); _finalize_parent_if_complete(job_id)
+        return {"ok": False, "error": result.get("error") or "PDF not produced."}
+    status_label = "Clear" if status == "clear" else ("Needs-Review" if status == "needs_review" else "Failed")
+    out_sn = _safe_filename(surname.upper(), f"SURNAME{row_number}")
+    final_name = _safe_filename(f"{out_sn} - {cert_clean} - {status_label} - {checked_date}.pdf", f"DBS-Result-{row_number}.pdf")
+    final_path = storage_path / final_name
+    try:
+        if final_path.exists(): final_path.unlink()
+        shutil.move(pdf_src, str(final_path))
+    except Exception:
+        final_path = Path(pdf_src); final_name = final_path.name
+    def mark_done(row: dict):
+        row.update({"status": status, "pdf_filename": final_name, "pdf_url": f"/dbs/download/{job_id}/{final_name}", "error": ""})
+    _update_row(job_id, row_number, mark_done)
+    job_data["status"] = status; _cset(child_id, job_data)
+    _finalize_parent_if_complete(job_id)
+    return {"ok": True, "child_id": child_id, "job_id": job_id, "status": status}

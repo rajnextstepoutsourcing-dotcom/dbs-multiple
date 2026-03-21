@@ -1,7 +1,7 @@
 """
 app.py — DBS Check Service (NextStep SaaS)
-Full implementation: auth, Redis queue, identity chain,
-isolated storage, ownership checks, token tracking.
+Full integration version: auth/session acceptance, embedded child-task dispatcher,
+identity chain, isolated storage, ownership checks, token tracking.
 """
 import sys, asyncio, anyio, logging, json, os, io, csv, re, secrets
 import datetime, shutil, uuid, zipfile, time
@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Fil
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.background import BackgroundTask
+from starlette.middleware.base import BaseHTTPMiddleware
 
 import fitz
 import pdfplumber
@@ -32,11 +33,36 @@ except Exception:
 
 APP_DIR      = os.path.dirname(os.path.abspath(__file__))
 REDIS_URL    = os.environ.get("REDIS_URL", "redis://localhost:6379")
-DBS_QUEUE    = "nextstep:dbs:jobs"
 STORAGE_ROOT = Path("/tmp/nextstep")
 STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+BACKEND_VALIDATE_URL = os.environ.get("BACKEND_VALIDATE_URL", "https://nextstep-backend-e75l.onrender.com/api/validate-session")
+APP_DASHBOARD_URL = os.environ.get("APP_DASHBOARD_URL", "https://nextstep-backend-e75l.onrender.com/dashboard")
+APP_LOGIN_URL = os.environ.get("APP_LOGIN_URL", "https://nextstep-backend-e75l.onrender.com/login")
+MAX_CONCURRENT_TASKS = max(1, int(os.environ.get("MAX_CONCURRENT_TASKS", "1")))
+WORKER_POLL_INTERVAL = max(1, int(os.environ.get("WORKER_POLL_INTERVAL", "2")))
+
+JOB_PREFIX = "nextstep:dbs:job:"
+OWNER_PREFIX = "nextstep:dbs:owner:"
+CHILD_PREFIX = "nextstep:dbs:child:"
+ACTIVE_CHILDREN_KEY = "nextstep:dbs:children:active"
+
+_redis = None
+_dispatcher_started = False
+_dispatcher_lock = __import__('threading').Lock()
+_local_active = set()
+_local_active_lock = __import__('threading').Lock()
+_last_parent_pointer = 0
+
+class PersistNextStepTokenMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        token = request.query_params.get("ns_token")
+        if token:
+            response.set_cookie(key="ns_token", value=token, httponly=True, samesite="lax", secure=True, max_age=60 * 60 * 8)
+        return response
 
 app = FastAPI(title="DBS Check — NextStep")
+app.add_middleware(PersistNextStepTokenMiddleware)
 app.mount("/static", StaticFiles(directory=os.path.join(APP_DIR, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(APP_DIR, "templates"))
 
@@ -57,7 +83,6 @@ def get_gemini_client():
 GEMINI_CLIENT = get_gemini_client()
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
-_redis = None
 def get_redis():
     global _redis
     if _redis is None:
@@ -69,48 +94,119 @@ def get_redis():
             log.error("[Redis] %s", e); _redis = None
     return _redis
 
+
+def _job_key(job_id: str) -> str:
+    return f"{JOB_PREFIX}{job_id}"
+
+
+def _owner_key(job_id: str) -> str:
+    return f"{OWNER_PREFIX}{job_id}"
+
+
+def _child_key(child_id: str) -> str:
+    return f"{CHILD_PREFIX}{child_id}"
+
+
+def _parent_queue_key(job_id: str) -> str:
+    return f"nextstep:dbs:parent:{job_id}:queue"
+
+
+def _job_to_dict(raw):
+    if not raw:
+        return None
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
 def _jget(job_id):
     r = get_redis()
     if not r: return None
-    try:
-        raw = r.get(f"nextstep:dbs:job:{job_id}")
-        return json.loads(raw) if raw else None
-    except: return None
+    return _job_to_dict(r.get(_job_key(job_id)))
+
 
 def _jset(job_id, state):
     r = get_redis()
     if not r: return
-    try: r.setex(f"nextstep:dbs:job:{job_id}", 3600, json.dumps(state))
+    try: r.setex(_job_key(job_id), 60 * 60 * 8, json.dumps(state))
     except: pass
+
 
 def _owner_set(job_id, tenant_id):
     r = get_redis()
     if not r: return
-    try: r.setex(f"nextstep:dbs:owner:{job_id}", 3600, str(tenant_id))
+    try: r.setex(_owner_key(job_id), 60 * 60 * 8, str(tenant_id))
     except: pass
+
 
 def _owner_get(job_id):
     r = get_redis()
     if not r: return None
     try:
-        v = r.get(f"nextstep:dbs:owner:{job_id}")
+        v = r.get(_owner_key(job_id))
         return int(v) if v else None
     except: return None
 
+
+def _child_get(child_id: str):
+    r = get_redis()
+    if not r:
+        return None
+    return _job_to_dict(r.get(_child_key(child_id)))
+
+
+def _child_set(child_id: str, payload: dict):
+    r = get_redis()
+    if not r:
+        return
+    r.setex(_child_key(child_id), 60 * 60 * 8, json.dumps(payload))
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
+def _validate_via_backend(token: str):
+    if not token:
+        return None
+    try:
+        import requests
+        resp = requests.get(BACKEND_VALIDATE_URL, params={"token": token}, timeout=8)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not data.get("valid"):
+            return None
+        user = data.get("user") or {}
+        tenant = data.get("tenant") or {}
+        return {
+            "user_id": user.get("id"),
+            "tenant_id": tenant.get("id"),
+            "role": user.get("role", "admin"),
+            "email": user.get("email"),
+            "name": user.get("name"),
+        }
+    except Exception as e:
+        log.warning("[Auth backend] %s", e)
+        return None
+
+
 def _get_ctx(request: Request):
     token = (request.headers.get("X-NextStep-Token")
              or request.cookies.get("ns_token")
              or request.query_params.get("ns_token") or "")
     if not token: return None
+    ctx = _validate_via_backend(token)
+    if ctx:
+        return ctx
     try:
         import db; return db.validate_user_token(token)
     except Exception as e:
-        log.warning("[Auth] %s", e); return None
+        log.warning("[Auth db] %s", e); return None
+
 
 def _auth(request: Request):
     ctx = _get_ctx(request)
-    if not ctx: raise HTTPException(401, "Not authenticated. Please log in at nextstep.co.uk")
+    if not ctx: raise HTTPException(401, f"Not authenticated. Please log in at {APP_LOGIN_URL}")
     return ctx
 
 # ── Storage ───────────────────────────────────────────────────────────────────
@@ -416,9 +512,222 @@ def _export_rows_extract(items):
     } for it in (items or [])]
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+@app.on_event("startup")
+def startup_event():
+    global _dispatcher_started
+    with _dispatcher_lock:
+        if _dispatcher_started:
+            return
+        _dispatcher_started = True
+        import threading
+        t = threading.Thread(target=_dispatcher_loop, daemon=True, name="dbs-child-dispatcher")
+        t.start()
+        log.info("[Dispatcher] started with MAX_CONCURRENT_TASKS=%d", MAX_CONCURRENT_TASKS)
+
+
+def _recover_stale_children():
+    r = get_redis()
+    if not r:
+        return
+    try:
+        for key in r.scan_iter(match=f"{CHILD_PREFIX}*"):
+            child = _job_to_dict(r.get(key))
+            if not child:
+                continue
+            if child.get("status") == "running":
+                child["status"] = "queued"
+                _child_set(child["child_id"], child)
+        r.delete(ACTIVE_CHILDREN_KEY)
+    except Exception as e:
+        log.warning("[Dispatcher] recovery failed: %s", e)
+
+
+def _list_parents_with_queue() -> List[str]:
+    r = get_redis()
+    if not r:
+        return []
+    job_ids = []
+    for key in r.scan_iter(match="nextstep:dbs:parent:*:queue"):
+        key_s = key.decode() if isinstance(key, bytes) else str(key)
+        parts = key_s.split(":")
+        if len(parts) >= 5:
+            job_id = parts[3]
+            try:
+                if r.llen(key_s) > 0:
+                    job_ids.append(job_id)
+            except Exception:
+                continue
+    job_ids.sort()
+    return job_ids
+
+
+def _active_count() -> int:
+    with _local_active_lock:
+        return len(_local_active)
+
+
+def _register_active(child_id: str):
+    r = get_redis()
+    with _local_active_lock:
+        _local_active.add(child_id)
+    if r:
+        r.sadd(ACTIVE_CHILDREN_KEY, child_id)
+
+
+def _unregister_active(child_id: str):
+    r = get_redis()
+    with _local_active_lock:
+        _local_active.discard(child_id)
+    if r:
+        r.srem(ACTIVE_CHILDREN_KEY, child_id)
+
+
+def _pick_next_child() -> Optional[str]:
+    global _last_parent_pointer
+    r = get_redis()
+    if not r:
+        return None
+    parents = _list_parents_with_queue()
+    if not parents:
+        return None
+    if _last_parent_pointer >= len(parents):
+        _last_parent_pointer = 0
+    ordered = parents[_last_parent_pointer:] + parents[:_last_parent_pointer]
+    for job_id in ordered:
+        qkey = _parent_queue_key(job_id)
+        child_id = r.lpop(qkey)
+        if child_id:
+            if isinstance(child_id, bytes):
+                child_id = child_id.decode("utf-8")
+            _last_parent_pointer = (parents.index(job_id) + 1) % max(1, len(parents))
+            return child_id
+    return None
+
+
+def _run_child_thread(child_id: str):
+    try:
+        import dbs_tasks
+        dbs_tasks.process_dbs_child(_child_get(child_id) or {})
+    except Exception as e:
+        log.exception("[Dispatcher] child %s failed: %s", child_id, e)
+    finally:
+        _unregister_active(child_id)
+
+
+def _dispatcher_loop():
+    _recover_stale_children()
+    while True:
+        try:
+            while _active_count() < MAX_CONCURRENT_TASKS:
+                child_id = _pick_next_child()
+                if not child_id:
+                    break
+                child = _child_get(child_id)
+                if not child or child.get("status") != "queued":
+                    continue
+                child["status"] = "running"
+                _child_set(child_id, child)
+                _register_active(child_id)
+                import threading
+                t = threading.Thread(target=_run_child_thread, args=(child_id,), daemon=True, name=f"dbs-child-{child_id[:8]}")
+                t.start()
+            time.sleep(WORKER_POLL_INTERVAL)
+        except Exception as e:
+            log.exception("[Dispatcher] loop error: %s", e)
+            time.sleep(WORKER_POLL_INTERVAL)
+
+
+def _now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat()
+
+
+def _create_parent_job(tenant_id: int, user_id: int, items: List[dict], db_job_id: Optional[int], storage_path: Path,
+                       org_name: str, emp_fn: str, emp_sn: str, reuse_rows: Optional[List[dict]] = None,
+                       old_job_id: Optional[str] = None) -> tuple[str, list[dict]]:
+    r = get_redis()
+    if not r:
+        raise HTTPException(500, "Redis unavailable.")
+    job_id = str(uuid.uuid4())
+    if reuse_rows is None:
+        rows = [{"row": i + 1, "status": "queued",
+                 "certificate_number": (it.get("certificate_number", "") if isinstance(it, dict) else ""),
+                 "surname": (it.get("surname", "") if isinstance(it, dict) else ""),
+                 "forename": (it.get("forename", "") if isinstance(it, dict) else ""),
+                 "dob_day": (it.get("dob_day", "") if isinstance(it, dict) else ""),
+                 "dob_month": (it.get("dob_month", "") if isinstance(it, dict) else ""),
+                 "dob_year": (it.get("dob_year", "") if isinstance(it, dict) else ""),
+                 "issue_day": (it.get("issue_day", "") if isinstance(it, dict) else ""),
+                 "issue_month": (it.get("issue_month", "") if isinstance(it, dict) else ""),
+                 "issue_year": (it.get("issue_year", "") if isinstance(it, dict) else ""),
+                 "original_filename": (it.get("original_filename", f"Row {i+1}") if isinstance(it, dict) else f"Row {i+1}"),
+                 "pdf_filename": "", "pdf_url": "", "error": "", "notes": ""}
+                for i, it in enumerate(items)]
+    else:
+        rows = reuse_rows
+    state = {
+        "state": "queued",
+        "rows": rows,
+        "zip_ready": False,
+        "zip_name": "",
+        "zip_url": "",
+        "checked_date": "",
+        "message": "Batch queued — processing starts shortly...",
+        "successful": 0,
+        "failed": 0,
+        "queued_count": sum(1 for r0 in rows if r0.get("status") == "queued"),
+        "running_count": 0,
+        "parent_total": len(rows),
+        "db_job_id": db_job_id,
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "storage_path": str(storage_path),
+        "organisation_name": org_name,
+        "employee_forename": emp_fn,
+        "employee_surname": emp_sn,
+        "created_at": _now_iso(),
+        "source_job_id": old_job_id or "",
+    }
+    _jset(job_id, state)
+    _owner_set(job_id, tenant_id)
+    return job_id, rows
+
+
+def _enqueue_child_tasks(job_id: str, tenant_id: int, user_id: int, storage_path: Path, org_name: str, emp_fn: str, emp_sn: str, items: List[dict]):
+    r = get_redis()
+    for idx, it in enumerate(items, start=1):
+        child_id = str(uuid.uuid4())
+        row_number = int(it.get("row_number") or idx)
+        payload = {
+            "child_id": child_id,
+            "job_id": job_id,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "row_number": row_number,
+            "storage_path": str(storage_path),
+            "organisation_name": org_name,
+            "employee_forename": emp_fn,
+            "employee_surname": emp_sn,
+            "certificate_number": (it.get("certificate_number") or "").strip(),
+            "surname": (it.get("surname") or "").strip(),
+            "forename": (it.get("forename") or "").strip(),
+            "dob_day": (it.get("dob_day") or "").strip(),
+            "dob_month": (it.get("dob_month") or "").strip(),
+            "dob_year": (it.get("dob_year") or "").strip(),
+            "issue_day": (it.get("issue_day") or "").strip(),
+            "issue_month": (it.get("issue_month") or "").strip(),
+            "issue_year": (it.get("issue_year") or "").strip(),
+            "original_filename": it.get("original_filename") or f"Row {idx}",
+            "status": "queued",
+            "created_at": _now_iso(),
+        }
+        _child_set(child_id, payload)
+        r.rpush(_parent_queue_key(job_id), child_id)
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse("index.html", {"request": request, "dashboard_url": APP_DASHBOARD_URL, "login_url": APP_LOGIN_URL})
+
 
 @app.get("/health")
 def health():
@@ -426,7 +735,7 @@ def health():
     try:
         if r: r.ping(); ok = True
     except: pass
-    return {"ok": True, "redis": ok, "gemini": bool(GEMINI_CLIENT), "db": bool(os.getenv("DATABASE_URL"))}
+    return {"ok": True, "redis": ok, "gemini": bool(GEMINI_CLIENT), "db": bool(os.getenv("DATABASE_URL")), "max_concurrent_tasks": MAX_CONCURRENT_TASKS}
 
 @app.post("/dbs/extract")
 async def dbs_extract(request: Request, files: List[UploadFile] = File(...)):
@@ -541,7 +850,6 @@ async def export_results(request: Request):
 async def dbs_run(request: Request):
     ctx = _auth(request)
     tenant_id = ctx["tenant_id"]; user_id = ctx["user_id"]
-
     payload: Dict = {}
     ctype = (request.headers.get("content-type") or "").lower()
     if "application/json" in ctype:
@@ -549,19 +857,15 @@ async def dbs_run(request: Request):
         except: payload = {}
     else:
         form = await request.form(); payload = dict(form)
-
-    org_name    = (payload.get("organisation_name") or payload.get("org_name") or "").strip()
-    emp_fn      = (payload.get("employee_forename") or payload.get("forename") or "").strip()
-    emp_sn      = (payload.get("employee_surname") or payload.get("surname_user") or payload.get("surname") or "").strip()
+    org_name = (payload.get("organisation_name") or payload.get("org_name") or "").strip()
+    emp_fn = (payload.get("employee_forename") or payload.get("forename") or "").strip()
+    emp_sn = (payload.get("employee_surname") or payload.get("surname_user") or payload.get("surname") or "").strip()
     if not (org_name and emp_fn and emp_sn):
         raise HTTPException(400, "Organisation/Forename/Surname is required.")
-
     items = payload.get("items")
     if not isinstance(items, list) or not items:
         raise HTTPException(400, "No items provided.")
     items = items[:100]
-
-    # Token check
     try:
         import db
         tokens = db.get_tenant_tokens_remaining(tenant_id)
@@ -569,67 +873,23 @@ async def dbs_run(request: Request):
         if 0 < tokens < len(items): items = items[:tokens]
     except HTTPException: raise
     except Exception as e: log.warning("[Run] Token check skipped: %s", e)
-
-    job_id = str(uuid.uuid4())
-    storage_path = _storage(tenant_id, user_id, job_id)
-
+    storage_path = _storage(tenant_id, user_id, str(uuid.uuid4()))
     db_job_id = None
     try:
         import db
         db_job_id = db.create_job_record(tenant_id=tenant_id, user_id=user_id, total_items=len(items))
     except Exception as e: log.warning("[Run] DB record failed: %s", e)
+    job_id, rows = _create_parent_job(tenant_id, user_id, items, db_job_id, storage_path, org_name, emp_fn, emp_sn)
+    real_storage = _storage(tenant_id, user_id, job_id)
+    if storage_path != real_storage and storage_path.exists() and not any(storage_path.iterdir()):
+        try: storage_path.rmdir()
+        except Exception: pass
+    st = _jget(job_id) or {}
+    st["storage_path"] = str(real_storage)
+    _jset(job_id, st)
+    _enqueue_child_tasks(job_id, tenant_id, user_id, real_storage, org_name, emp_fn, emp_sn, items)
+    return JSONResponse({"job_id": job_id, "mode": "bulk", "status_url": f"/dbs/status/{job_id}", "rows": rows, "queued": True})
 
-    rows = [{"row": i+1, "status": "queued",
-             "certificate_number": (it.get("certificate_number","") if isinstance(it,dict) else ""),
-             "surname": (it.get("surname","") if isinstance(it,dict) else ""),
-             "forename": (it.get("forename","") if isinstance(it,dict) else ""),
-             "dob_day": (it.get("dob_day","") if isinstance(it,dict) else ""),
-             "dob_month": (it.get("dob_month","") if isinstance(it,dict) else ""),
-             "dob_year": (it.get("dob_year","") if isinstance(it,dict) else ""),
-             "issue_day": (it.get("issue_day","") if isinstance(it,dict) else ""),
-             "issue_month": (it.get("issue_month","") if isinstance(it,dict) else ""),
-             "issue_year": (it.get("issue_year","") if isinstance(it,dict) else ""),
-             "original_filename": (it.get("original_filename",f"Row {i+1}") if isinstance(it,dict) else f"Row {i+1}"),
-             "pdf_filename": "", "pdf_url": "", "error": "", "notes": ""}
-            for i, it in enumerate(items)]
-
-    _jset(job_id, {"state": "queued", "rows": rows, "zip_ready": False,
-                   "zip_name": "", "zip_url": "", "checked_date": "",
-                   "message": "Job queued — processing starts shortly...",
-                   "successful": 0, "failed": 0})
-    _owner_set(job_id, tenant_id)
-
-    job_data = {"job_id": job_id, "db_job_id": db_job_id,
-                "tenant_id": tenant_id, "user_id": user_id,
-                "items": items, "storage_path": str(storage_path),
-                "organisation_name": org_name,
-                "employee_forename": emp_fn,
-                "employee_surname": emp_sn}
-
-    enqueued = False
-    try:
-        from rq import Queue as RQ
-        import redis as rl
-        q = RQ(DBS_QUEUE, connection=rl.Redis.from_url(REDIS_URL))
-        q.enqueue("dbs_tasks.process_dbs_job", job_data, job_timeout=7200, result_ttl=3600)
-        enqueued = True
-        log.info("[Run] DBS job %s enqueued %d items tenant=%d", job_id, len(items), tenant_id)
-    except Exception as e:
-        log.error("[Run] Enqueue failed, running directly: %s", e)
-        asyncio.get_event_loop().create_task(_direct(job_id, job_data))
-
-    return JSONResponse({"job_id": job_id, "mode": "bulk",
-                         "status_url": f"/dbs/status/{job_id}",
-                         "rows": rows, "queued": enqueued})
-
-async def _direct(job_id, job_data):
-    try:
-        import dbs_tasks
-        from functools import partial
-        await anyio.to_thread.run_sync(partial(dbs_tasks.process_dbs_job, job_data), cancellable=True)
-    except Exception as e:
-        log.error("[Direct] %s", e)
-        _jset(job_id, {"state": "done", "message": f"Job failed: {e}", "zip_ready": False})
 
 @app.get("/dbs/status/{job_id}")
 async def dbs_status(job_id: str, request: Request):
@@ -637,29 +897,31 @@ async def dbs_status(job_id: str, request: Request):
     state = _jget(job_id)
     if not state: raise HTTPException(404, "Job expired or not found.")
     rows = state.get("rows") or []
-    done = sum(1 for r in rows if r.get("status") in ("clear","needs_review","portal_unavailable","failed"))
-    return JSONResponse({"job_id": job_id, "mode": "bulk",
-                         "state": state.get("state","queued"),
-                         "checked_date": state.get("checked_date",""),
-                         "running": {"done": done, "total": len(rows) or 1},
-                         "rows": rows,
-                         "zip_ready": bool(state.get("zip_ready")),
-                         "zip_name": state.get("zip_name",""),
-                         "zip_url": state.get("zip_url",""),
-                         "message": state.get("message",""),
-                         "successful": state.get("successful",0),
-                         "failed": state.get("failed",0)})
+    done = sum(1 for r in rows if r.get("status") in ("clear", "needs_review", "portal_unavailable", "failed"))
+    running = sum(1 for r in rows if r.get("status") == "running")
+    queued = sum(1 for r in rows if r.get("status") == "queued")
+    return JSONResponse({"job_id": job_id, "mode": "bulk", "state": state.get("state","queued"), "checked_date": state.get("checked_date",""), "running": {"done": done, "total": len(rows) or 1}, "rows": rows, "zip_ready": bool(state.get("zip_ready")), "zip_name": state.get("zip_name",""), "zip_url": state.get("zip_url",""), "message": state.get("message",""), "successful": state.get("successful",0), "failed": state.get("failed",0), "running_count": running, "queued_count": queued})
+
 
 @app.get("/dbs/download/{job_id}/{name}")
 async def dbs_download(job_id: str, name: str, request: Request):
     ctx = _auth(request); tenant_id = ctx["tenant_id"]
     job_tenant = _owner_get(job_id)
     if job_tenant is not None and job_tenant != tenant_id:
-        log.warning("[DL] Tenant %d tried job owned by %d", tenant_id, job_tenant)
         raise HTTPException(403, "Access denied.")
     tenant_root = STORAGE_ROOT / str(tenant_id); file_path = None
     for p in tenant_root.rglob(name):
         if job_id in str(p): file_path = p; break
+    if not file_path:
+        state = _jget(job_id) or {}
+        source_job_id = state.get("source_job_id") or ""
+        for p in tenant_root.rglob(name):
+            if source_job_id and source_job_id in str(p):
+                file_path = p; break
+    if not file_path:
+        matches = list(tenant_root.rglob(name))
+        if len(matches) == 1:
+            file_path = matches[0]
     if not file_path or not file_path.exists():
         raise HTTPException(404, "Download expired or not found.")
     bg = None
@@ -668,6 +930,7 @@ async def dbs_download(job_id: str, name: str, request: Request):
         bg = BackgroundTask(_cleanup, sp, job_id)
     return FileResponse(str(file_path), filename=name, media_type="application/octet-stream", background=bg)
 
+
 def _cleanup(storage_path: Path, job_id: str):
     import time as t; t.sleep(5)
     try:
@@ -675,89 +938,55 @@ def _cleanup(storage_path: Path, job_id: str):
     except Exception as e: log.warning("[Cleanup] %s", e)
     r = get_redis()
     if r:
-        try: r.delete(f"nextstep:dbs:job:{job_id}"); r.delete(f"nextstep:dbs:owner:{job_id}")
-        except: pass
+        try:
+            r.delete(_job_key(job_id)); r.delete(_owner_key(job_id)); r.delete(_parent_queue_key(job_id))
+            for key in r.scan_iter(match=f"{CHILD_PREFIX}*"):
+                child = _job_to_dict(r.get(key))
+                if child and child.get("job_id") == job_id:
+                    r.delete(key)
+        except Exception: pass
 
-# ── Rerun (dirty rows only) ────────────────────────────────────────────────────
+
 @app.post("/dbs/rerun")
 async def dbs_rerun(request: Request):
     ctx = _auth(request)
     tenant_id = ctx["tenant_id"]; user_id = ctx["user_id"]
     try: payload = await request.json()
     except: raise HTTPException(400, "Invalid JSON.")
-
     old_job_id = (payload.get("job_id") or "").strip()
     dirty_items = payload.get("items") or []
     org_name  = (payload.get("organisation_name") or "").strip()
     emp_fn    = (payload.get("employee_forename") or "").strip()
     emp_sn    = (payload.get("employee_surname") or "").strip()
-
     if not old_job_id: raise HTTPException(400, "job_id required.")
     if not dirty_items: raise HTTPException(400, "No items for rerun.")
-
     job_tenant = _owner_get(old_job_id)
     if job_tenant is not None and job_tenant != tenant_id:
         raise HTTPException(403, "Access denied.")
-
     old_state = _jget(old_job_id)
     if not old_state: raise HTTPException(404, "Original job expired. Please run fresh.")
-
     old_rows = old_state.get("rows") or []
-    old_storage = STORAGE_ROOT / str(tenant_id) / str(user_id) / old_job_id
-
-    dirty_count = len(dirty_items)
+    storage_path = STORAGE_ROOT / str(tenant_id) / str(user_id) / old_job_id
     try:
         import db
         tokens = db.get_tenant_tokens_remaining(tenant_id)
         if tokens == 0: raise HTTPException(402, "No tokens remaining.")
-        if 0 < tokens < dirty_count: dirty_items = dirty_items[:tokens]; dirty_count = len(dirty_items)
+        if 0 < tokens < len(dirty_items): dirty_items = dirty_items[:tokens]
     except HTTPException: raise
     except Exception as e: log.warning("[Rerun] Token check skipped: %s", e)
-
-    new_job_id = str(uuid.uuid4())
-    storage_path = old_storage  # reuse same folder
-
     db_job_id = None
     try:
         import db
-        db_job_id = db.create_job_record(tenant_id=tenant_id, user_id=user_id, total_items=dirty_count)
+        db_job_id = db.create_job_record(tenant_id=tenant_id, user_id=user_id, total_items=len(dirty_items))
     except Exception as e: log.warning("[Rerun] DB record: %s", e)
-
-    dirty_row_nums = {it.get("row_number") for it in dirty_items if it.get("row_number")}
+    dirty_map = {int(it.get("row_number") or 0): it for it in dirty_items}
     merged_rows = []
-    for r in old_rows:
-        rnum = r.get("row", 0)
-        if rnum in dirty_row_nums:
-            merged_rows.append({**r, "status": "queued", "pdf_filename": "", "pdf_url": "", "error": "", "notes": ""})
+    for r0 in old_rows:
+        row_no = int(r0.get("row") or 0)
+        if row_no in dirty_map:
+            merged_rows.append({**r0, "status": "queued", "certificate_number": (dirty_map[row_no].get("certificate_number") or "").strip(), "surname": (dirty_map[row_no].get("surname") or "").strip(), "forename": (dirty_map[row_no].get("forename") or "").strip(), "dob_day": (dirty_map[row_no].get("dob_day") or "").strip(), "dob_month": (dirty_map[row_no].get("dob_month") or "").strip(), "dob_year": (dirty_map[row_no].get("dob_year") or "").strip(), "issue_day": (dirty_map[row_no].get("issue_day") or "").strip(), "issue_month": (dirty_map[row_no].get("issue_month") or "").strip(), "issue_year": (dirty_map[row_no].get("issue_year") or "").strip(), "pdf_filename": "", "pdf_url": "", "error": "", "notes": ""})
         else:
-            merged_rows.append(r)
-
-    _jset(new_job_id, {"state": "queued", "rows": merged_rows,
-                        "zip_ready": old_state.get("zip_ready", False),
-                        "zip_name": old_state.get("zip_name", ""),
-                        "zip_url": old_state.get("zip_url", ""),
-                        "checked_date": old_state.get("checked_date", ""),
-                        "message": f"Rerunning {dirty_count} edited row(s)…",
-                        "successful": 0, "failed": 0})
-    _owner_set(new_job_id, tenant_id)
-
-    job_data = {"job_id": new_job_id, "db_job_id": db_job_id,
-                "tenant_id": tenant_id, "user_id": user_id,
-                "items": dirty_items, "storage_path": str(storage_path),
-                "organisation_name": org_name, "employee_forename": emp_fn, "employee_surname": emp_sn,
-                "is_rerun": True, "old_rows": old_rows, "dirty_row_nums": list(dirty_row_nums)}
-
-    enqueued = False
-    try:
-        from rq import Queue as RQ
-        import redis as rl
-        q = RQ(DBS_QUEUE, connection=rl.Redis.from_url(REDIS_URL))
-        q.enqueue("dbs_tasks.process_dbs_job", job_data, job_timeout=7200, result_ttl=3600)
-        enqueued = True
-        log.info("[Rerun] DBS job %s queued — %d dirty rows", new_job_id, dirty_count)
-    except Exception as e:
-        log.error("[Rerun] Enqueue failed: %s", e)
-        asyncio.get_event_loop().create_task(_direct(new_job_id, job_data))
-
-    return JSONResponse({"job_id": new_job_id, "status_url": f"/dbs/status/{new_job_id}",
-                         "rows": merged_rows, "queued": enqueued})
+            merged_rows.append(r0)
+    job_id, rows = _create_parent_job(tenant_id, user_id, dirty_items, db_job_id, storage_path, org_name, emp_fn, emp_sn, reuse_rows=merged_rows, old_job_id=old_job_id)
+    _enqueue_child_tasks(job_id, tenant_id, user_id, storage_path, org_name, emp_fn, emp_sn, dirty_items)
+    return JSONResponse({"job_id": job_id, "status_url": f"/dbs/status/{job_id}", "rows": rows, "queued": True})

@@ -18,19 +18,13 @@ services:
         sync: false
       - key: NEXTSTEP_INTERNAL_TOKEN
         sync: false
-
-  - type: worker
-    name: dbs-worker
-    env: python
-    plan: standard
-    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
-    startCommand: python worker.py
-    envVars:
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: DATABASE_URL
-        sync: false
-      - key: REDIS_URL
-        sync: false
-      - key: NEXTSTEP_INTERNAL_TOKEN
-        sync: false
+      - key: MAX_CONCURRENT_TASKS
+        value: "1"
+      - key: WORKER_POLL_INTERVAL
+        value: "2"
+      - key: TASK_TIMEOUT_SECONDS
+        value: "600"
+      - key: MAX_TASK_RETRIES
+        value: "1"
+      - key: ZIP_ON_COMPLETE
+        value: "true"
