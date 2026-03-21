@@ -231,7 +231,6 @@ function _clearDirtyFlags(){document.querySelectorAll("#bulkList .bulkRow").forE
 function updateBulkUIFromStatus(data,isRerun=false){
   const done=(data.running||{}).done||0;const total=(data.running||{}).total||0;
   _showProgress(done,total,data.state||"running",data.message||"");
-  if(total)setText("runBulkStatus",`${done}/${total} complete`);
 
   (data.rows||[]).forEach((r,idx)=>{
     const rowNum=r.row||idx+1;
@@ -267,7 +266,7 @@ function updateBulkUIFromStatus(data,isRerun=false){
     stopPolling();setDisabled("btnRunBulk",false);
     const runBtn=$("btnRunBulk");
     if(runBtn){runBtn.classList.remove("isRunning");runBtn.textContent="Run All Checks";}
-    setText("runBulkStatus",`Completed ${done}/${total}`);
+    setText("runBulkStatus","");
     toast(`Run complete (${done}/${total})`,"bottom-right");
     _showRerunIfNeeded();
   }

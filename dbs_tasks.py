@@ -58,7 +58,7 @@ def _update_row(job_id: str, row_number: int, updater):
             return None
         row = rows[idx]
         updater(row)
-        successful = sum(1 for r in rows if r.get("status") in ("clear", "needs_review"))
+        successful = sum(1 for r in rows if r.get("status") in ("clear", "needs_review") and not bool(r.get("billing_waived")) and bool((r.get("pdf_filename") or "").strip() or (r.get("pdf_url") or "").strip()))
         failed = sum(1 for r in rows if r.get("status") in ("portal_unavailable", "failed"))
         running = sum(1 for r in rows if r.get("status") == "running")
         queued = sum(1 for r in rows if r.get("status") == "queued")
@@ -106,7 +106,7 @@ def _finalize_parent_if_complete(job_id: str):
             return
         rows = state.get("rows") or []
         total = len(rows)
-        successful = sum(1 for r in rows if r.get("status") in ("clear", "needs_review"))
+        successful = sum(1 for r in rows if r.get("status") in ("clear", "needs_review") and not bool(r.get("billing_waived")) and bool((r.get("pdf_filename") or "").strip() or (r.get("pdf_url") or "").strip()))
         failed = sum(1 for r in rows if r.get("status") in ("portal_unavailable", "failed"))
         running = sum(1 for r in rows if r.get("status") == "running")
         queued = sum(1 for r in rows if r.get("status") == "queued")
@@ -247,7 +247,7 @@ def process_dbs_child(job_data: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         final_path = Path(pdf_src); final_name = final_path.name
     def mark_done(row: dict):
-        row.update({"status": status, "pdf_filename": final_name, "pdf_url": f"/dbs/download/{job_id}/{final_name}", "error": ""})
+        row.update({"status": status, "pdf_filename": final_name, "pdf_url": f"/dbs/download/{job_id}/{final_name}", "error": "", "billing_waived": False})
     _update_row(job_id, row_number, mark_done)
     job_data["status"] = status; _cset(child_id, job_data)
     _finalize_parent_if_complete(job_id)

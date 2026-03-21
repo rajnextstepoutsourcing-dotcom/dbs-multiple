@@ -151,6 +151,15 @@ def _owner_get(job_id):
     except: return None
 
 
+
+
+def _row_is_billable(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    status = str(row.get("status") or "").strip()
+    has_pdf = bool((row.get("pdf_filename") or "").strip() or (row.get("pdf_url") or "").strip())
+    return status in ("clear", "needs_review") and has_pdf and not bool(row.get("billing_waived"))
+
 def _child_get(child_id: str):
     r = get_redis()
     if not r:
@@ -1030,6 +1039,7 @@ async def dbs_rerun(request: Request):
     if not old_state: raise HTTPException(404, "Original job expired. Please run fresh.")
     old_rows = old_state.get("rows") or []
     storage_path = STORAGE_ROOT / str(tenant_id) / str(user_id) / old_job_id
+    old_db_job_id = old_state.get("db_job_id")
     try:
         import db
         tokens = db.get_tenant_tokens_remaining(tenant_id)
@@ -1045,12 +1055,32 @@ async def dbs_rerun(request: Request):
     dirty_items = [_normalize_item_fields(it) for it in dirty_items]
     dirty_map = {int(it.get("row_number") or 0): it for it in dirty_items}
     merged_rows = []
+    waived_count = 0
+    updated_old_rows = []
     for r0 in old_rows:
         row_no = int(r0.get("row") or 0)
+        current_old = dict(r0)
         if row_no in dirty_map:
-            merged_rows.append({**r0, "status": "queued", "certificate_number": (dirty_map[row_no].get("certificate_number") or "").strip(), "surname": (dirty_map[row_no].get("surname") or "").strip(), "forename": (dirty_map[row_no].get("forename") or "").strip(), "dob_day": (dirty_map[row_no].get("dob_day") or "").strip(), "dob_month": (dirty_map[row_no].get("dob_month") or "").strip(), "dob_year": (dirty_map[row_no].get("dob_year") or "").strip(), "issue_day": (dirty_map[row_no].get("issue_day") or "").strip(), "issue_month": (dirty_map[row_no].get("issue_month") or "").strip(), "issue_year": (dirty_map[row_no].get("issue_year") or "").strip(), "pdf_filename": "", "pdf_url": "", "error": "", "notes": ""})
+            if _row_is_billable(current_old):
+                current_old["billing_waived"] = True
+                current_old["notes"] = ((current_old.get("notes") or "") + " Waived after user edit/rerun.").strip()
+                waived_count += 1
+            updated_old_rows.append(current_old)
+            merged_rows.append({**current_old, "status": "queued", "certificate_number": (dirty_map[row_no].get("certificate_number") or "").strip(), "surname": (dirty_map[row_no].get("surname") or "").strip(), "forename": (dirty_map[row_no].get("forename") or "").strip(), "dob_day": (dirty_map[row_no].get("dob_day") or "").strip(), "dob_month": (dirty_map[row_no].get("dob_month") or "").strip(), "dob_year": (dirty_map[row_no].get("dob_year") or "").strip(), "issue_day": (dirty_map[row_no].get("issue_day") or "").strip(), "issue_month": (dirty_map[row_no].get("issue_month") or "").strip(), "issue_year": (dirty_map[row_no].get("issue_year") or "").strip(), "pdf_filename": "", "pdf_url": "", "error": "", "notes": "", "billing_waived": False})
         else:
-            merged_rows.append(r0)
+            updated_old_rows.append(current_old)
+            merged_rows.append(current_old)
+    if waived_count > 0:
+        old_state["rows"] = updated_old_rows
+        old_state["successful"] = sum(1 for row in updated_old_rows if _row_is_billable(row))
+        old_state["failed"] = sum(1 for row in updated_old_rows if (row.get("status") in ("portal_unavailable", "failed")))
+        old_state["message"] = f"{waived_count} earlier billed row(s) waived after user edits."
+        _jset(old_job_id, old_state)
+        try:
+            import db
+            db.reverse_usage(tenant_id=tenant_id, user_id=user_id, db_job_id=old_db_job_id, reversed_outputs=waived_count)
+        except Exception as e:
+            log.warning("[Rerun] reverse_usage failed: %s", e)
     job_id, rows = _create_parent_job(tenant_id, user_id, dirty_items, db_job_id, storage_path, org_name, emp_fn, emp_sn, reuse_rows=merged_rows, old_job_id=old_job_id)
     _enqueue_child_tasks(job_id, tenant_id, user_id, storage_path, org_name, emp_fn, emp_sn, dirty_items)
     return JSONResponse({"job_id": job_id, "status_url": f"/dbs/status/{job_id}", "rows": rows, "queued": True})

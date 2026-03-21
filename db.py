@@ -140,6 +140,27 @@ def record_usage(*, tenant_id: int, user_id: int, db_job_id: Optional[int], succ
         session.close()
 
 
+
+
+def reverse_usage(*, tenant_id: int, user_id: int, db_job_id: Optional[int], reversed_outputs: int) -> None:
+    if reversed_outputs <= 0:
+        return
+    session = get_session()
+    if not session:
+        return
+    try:
+        tool_id = get_dbs_tool_id()
+        session.execute(text("""
+            INSERT INTO usage_records (tenant_id, user_id, tool_id, job_id, billable_output_count, created_at)
+            VALUES (:tenant_id, :user_id, :tool_id, :job_id, :count, :now)
+        """), {"tenant_id": tenant_id, "user_id": user_id, "tool_id": tool_id, "job_id": db_job_id, "count": -abs(reversed_outputs), "now": datetime.utcnow()})
+        session.execute(text("UPDATE tenants SET tokens_used = GREATEST(tokens_used - :count, 0) WHERE id = :tenant_id"), {"count": reversed_outputs, "tenant_id": tenant_id})
+        session.commit()
+    except Exception as e:
+        log.error("[DB] reverse_usage error: %s", e)
+        session.rollback()
+    finally:
+        session.close()
 def validate_user_token(token: str) -> Optional[dict]:
     if not token:
         return None
