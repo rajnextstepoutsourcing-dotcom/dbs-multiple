@@ -421,12 +421,14 @@ def gemini_vision_extract_images(images):
         dob_ok = bool(str(dob.get("day","")).strip() and str(dob.get("month","")).strip() and str(dob.get("year","")).strip()) if isinstance(dob, dict) else False
         return not (cert_ok and sn_ok and dob_ok)
 
-    data = {}
     try: data = _call(GEMINI_MODEL_FAST)
-    except: data = {}
+    except Exception as e:
+        log.error(f"[Gemini FAST={GEMINI_MODEL_FAST}] failed: {e}")
+        data = {}
     if _missing(data):
         try: data = _call(GEMINI_MODEL_STRONG)
-        except: pass
+        except Exception as e:
+            log.error(f"[Gemini STRONG={GEMINI_MODEL_STRONG}] failed: {e}")
 
     def _gv(k): v = data.get(k); return str(v.get("value","") if isinstance(v, dict) else v or "")
     def _gc(k):
